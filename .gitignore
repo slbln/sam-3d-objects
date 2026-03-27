@@ -1,1 +1,9 @@
 __pycache__
+CLAUDE.md
+.vscode
+.gitignore
+.github
+submodules
+*.glb
+*.ply
+outputs

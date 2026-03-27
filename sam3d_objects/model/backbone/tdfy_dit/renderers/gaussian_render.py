@@ -103,13 +103,6 @@ def render(
 
     # Backend-specific rasterization setup and execution
     if backend == "inria":
-        kernel_size = pipe.kernel_size
-        subpixel_offset = torch.zeros(
-            (int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), 2),
-            dtype=torch.float32,
-            device="cuda",
-        )
-
         # Set up rasterization configuration
         tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
         tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
@@ -138,8 +131,6 @@ def render(
             image_width=int(viewpoint_camera.image_width),
             tanfovx=tanfovx,
             tanfovy=tanfovy,
-            kernel_size=kernel_size,
-            subpixel_offset=subpixel_offset,
             bg=bg_color,
             scale_modifier=scaling_modifier,
             viewmatrix=viewpoint_camera.world_view_transform,

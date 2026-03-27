@@ -1,4 +1,11 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+import os
+
+# Set environment variables to ensure that the Hugging Face libraries operate in offline mode.
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_DATASETS_OFFLINE"] = "1"
+
 import sys
 
 # import inference code
@@ -18,5 +25,6 @@ mask = load_single_mask("notebook/images/shutterstock_stylish_kidsroom_164080656
 output = inference(image, mask, seed=42)
 
 # export gaussian splat
-output["gs"].save_ply(f"splat.ply")
-print("Your reconstruction has been saved to splat.ply")
+os.makedirs("outputs", exist_ok=True)
+output["gs"].save_ply(f"outputs/splat.ply")
+print("Your reconstruction has been saved to outputs/splat.ply")
