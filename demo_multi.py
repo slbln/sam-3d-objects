@@ -24,6 +24,11 @@ from PIL import Image
 sys.path.append("notebook")
 from inference import Inference, load_image, load_masks
 
+# =========================================================
+# Global options
+# =========================================================
+SKIP_EXISTING_OUTPUTS = True  # If True, skip generation when GLB and pose JSON already exist
+
 
 # =========================================================
 # Utils
@@ -104,6 +109,52 @@ def mask_area(mask):
 
 def ensure_dir(path):
     Path(path).mkdir(parents=True, exist_ok=True)
+
+
+def apply_pose_to_mesh(mesh, rotation, translation, scale):
+    """
+    Apply pose transformation to mesh vertices.
+
+    The GLB vertices are in z-up format. The pose operates in y-up format.
+    We convert z-up to y-up (same as get_mesh), then apply the pose using the
+    same convention as compose_transform / SceneVisualizer.object_pointcloud:
+        v_world = (v_yup * scale) @ R + translation
+    where R = quaternion_to_matrix(rotation).
+    """
+    import numpy as np
+
+    verts = np.asarray(mesh.vertices).copy().astype(np.float32)
+
+    # B: z-up to y-up (same matrix as in get_mesh from layout_post_optimization_utils.py)
+    B = np.array([
+        [1, 0, 0],
+        [0, 0, -1],
+        [0, 1, 0],
+    ], dtype=np.float32)
+
+    # Convert z-up to y-up
+    verts_yup = verts @ B.T
+
+    # quaternion to rotation matrix (w, x, y, z) — standard formula matching pytorch3d
+    quat = np.array(rotation).reshape(-1).astype(np.float32)
+    quat = quat / np.linalg.norm(quat)
+    w, x, y, z = quat[0], quat[1], quat[2], quat[3]
+    R = np.array([
+        [1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w)],
+        [2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w)],
+        [2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)]
+    ], dtype=np.float32)
+
+    s = np.array(scale).reshape(-1).astype(np.float32)
+    t = np.array(translation).reshape(-1).astype(np.float32)
+
+    # Apply pose: v_world = (v_yup * scale) @ R + translation
+    # This matches compose_transform(scale, R, translation).transform_points(v)
+    # used in SceneVisualizer.object_pointcloud and make_scene.
+    verts_world = (verts_yup * s) @ R + t
+
+    mesh.vertices = verts_world
+    return mesh
 
 
 # =========================================================
@@ -285,6 +336,17 @@ def run_single_object(
     area = mask_area(mask)
     info["mask_area"] = area
 
+    glb_path = os.path.join(output_dir, f"model_{object_idx:03d}.glb")
+    pose_path = os.path.join(output_dir, f"model_{object_idx:03d}_pose.json")
+
+    # Skip if outputs already exist and SKIP_EXISTING_OUTPUTS is enabled
+    if SKIP_EXISTING_OUTPUTS and os.path.exists(glb_path) and os.path.exists(pose_path):
+        info["glb_path"] = glb_path
+        info["pose_path"] = pose_path
+        info["success"] = True
+        log(f"Object {object_idx:03d}: skipped (outputs exist)")
+        return info
+
     if area < min_mask_area:
         info["error_type"] = "tiny_mask"
         info["error_message"] = f"mask area too small: {area}"
@@ -338,6 +400,25 @@ def run_single_object(
             if output.get("glb", None) is not None:
                 output["glb"].export(glb_path)
                 info["glb_path"] = glb_path
+
+                # Save pose metadata: rotation, translation, scale, center
+                verts = np.asarray(output["glb"].vertices)
+                vmin, vmax = verts.min(axis=0), verts.max(axis=0)
+                center = ((vmax + vmin) / 2.0).tolist()
+
+                pose_info = {
+                    "object_index": object_idx,
+                    "glb_path": glb_path,
+                    "rotation": output["rotation"].detach().cpu().tolist(),
+                    "translation": output["translation"].detach().cpu().tolist(),
+                    "scale": output["scale"].detach().cpu().tolist(),
+                    "center": center,
+                }
+                pose_path = os.path.join(output_dir, f"model_{object_idx:03d}_pose.json")
+                with open(pose_path, "w", encoding="utf-8") as f:
+                    json.dump(pose_info, f, ensure_ascii=False, indent=2)
+                info["pose_path"] = pose_path
+
                 info["success"] = True
                 log(f"Object {object_idx:03d}: success -> {glb_path}")
                 return info
@@ -407,8 +488,8 @@ def main():
     tag = "hf"
     config_path = f"checkpoints/{tag}/pipeline.yaml"
 
-    image_path = "notebook/images/shutterstock_stylish_kidsroom_1640806567/image.png"
-    output_dir = "outputs/shutterstock_stylish_kidsroom_1640806567"
+    image_path = "notebook/images/chair_001/image.png"
+    output_dir = "outputs/chair_001"
 
     # 从高到低自动重试
     retry_scales = [1.00, 0.85, 0.70, 0.55, 0.45]
@@ -530,17 +611,34 @@ def main():
     for result in summary["results"]:
         if result["success"] and result.get("glb_path"):
             glb_path = result["glb_path"]
-            if os.path.exists(glb_path):
+            pose_path = result.get("pose_path")
+            if os.path.exists(glb_path) and pose_path and os.path.exists(pose_path):
                 try:
+                    with open(pose_path, "r", encoding="utf-8") as f:
+                        pose = json.load(f)
+
                     obj_mesh = trimesh.load(glb_path)
                     # Handle scene files with multiple meshes
                     if isinstance(obj_mesh, trimesh.Scene):
                         for name, geom in obj_mesh.geometry.items():
-                            scene.add_geometry(geom, node_name=f"object_{result['object_index']:03d}_{name}")
+                            # apply pose transform to each sub-geometry
+                            transformed_geom = apply_pose_to_mesh(
+                                geom,
+                                pose["rotation"],
+                                pose["translation"],
+                                pose["scale"],
+                            )
+                            scene.add_geometry(transformed_geom, node_name=f"object_{result['object_index']:03d}_{name}")
                     else:
-                        scene.add_geometry(obj_mesh, node_name=f"object_{result['object_index']:03d}")
+                        transformed_mesh = apply_pose_to_mesh(
+                            obj_mesh,
+                            pose["rotation"],
+                            pose["translation"],
+                            pose["scale"],
+                        )
+                        scene.add_geometry(transformed_mesh, node_name=f"object_{result['object_index']:03d}")
                     combined_count += 1
-                    log(f"  Added: {glb_path}")
+                    log(f"  Added: {glb_path} with pose transform")
                 except Exception as e:
                     log(f"  Failed to load {glb_path}: {e}")
 
